@@ -79,22 +79,105 @@ class FlashingThread(threading.Thread):
 
     def run(self):
         try:
+            # Basic heuristic: If the firmware path includes ".ino.bin", assume ESP32/Arduino
+            # TODO: Replace this with a proper UI element for chip selection
+            is_esp32_arduino = self._config.firmware_path and ".ino.bin" in os.path.basename(self._config.firmware_path)
+
             command = []
 
             if not self._config.port.startswith(__auto_select__):
                 command.append("--port")
                 command.append(self._config.port)
 
-            command.extend(["--baud", str(self._config.baud),
-                            "--after", "no_reset",
-                            "write_flash",
-                            # https://github.com/espressif/esptool/issues/599
-                            "--flash_size", "detect",
-                            "--flash_mode", self._config.mode,
-                            "0x00000", self._config.firmware_path])
+            command.extend(["--baud", str(self._config.baud)])
+
+            if is_esp32_arduino:
+                chip = "esp32s2"  # Hardcoded based on user feedback for .ino.bin files
+                flash_freq = "80m" # Hardcoded for now
+                flash_size = "4MB" # Hardcoded for now
+                app_offset = "0x10000" # Default offset for app binary
+                app_path = self._config.firmware_path
+
+                # Get optional paths/offsets from config (populated by UI)
+                custom_bootloader_path = self._config.custom_bootloader_path
+                custom_bootloader_offset = self._config.custom_bootloader_offset
+                custom_partitions_path = self._config.custom_partitions_path
+                custom_partitions_offset = self._config.custom_partitions_offset
+
+
+                command.extend([f"--chip", chip])
+                command.extend(["--before", "default_reset", "--after", "hard_reset"])
+                command.extend(["write_flash", "-z"])
+                command.extend(["--flash_mode", self._config.mode]) # Keep mode configurable
+                command.extend([f"--flash_freq", flash_freq, f"--flash_size", flash_size])
+
+                # Build the flashing address/path pairs
+                flash_files = []
+                # Add bootloader if path is provided and exists
+                if custom_bootloader_path and os.path.exists(custom_bootloader_path):
+                     # Basic validation for offset format (optional)
+                     if not custom_bootloader_offset.startswith("0x"): custom_bootloader_offset = "0x1000" # Fallback
+                     flash_files.extend([custom_bootloader_offset, custom_bootloader_path])
+                elif custom_bootloader_path: # Path provided but file doesn't exist
+                    print(f"Warning: Bootloader file specified but not found: {custom_bootloader_path}")
+
+
+                # Add partitions if path is provided and exists
+                if custom_partitions_path and os.path.exists(custom_partitions_path):
+                     # Basic validation for offset format (optional)
+                     if not custom_partitions_offset.startswith("0x"): custom_partitions_offset = "0x8000" # Fallback
+                     flash_files.extend([custom_partitions_offset, custom_partitions_path])
+                elif custom_partitions_path: # Path provided but file doesn't exist
+                     print(f"Warning: Partitions file specified but not found: {custom_partitions_path}")
+
+
+                # Always include the main application binary (check existence)
+                if app_path and os.path.exists(app_path):
+                    if not app_offset.startswith("0x"): app_offset = "0x10000" # Fallback
+                    flash_files.extend([app_offset, app_path])
+                else:
+                     self._parent.report_error(f"Application firmware file not found: {app_path}")
+                     return # Cannot proceed without app firmware
+
+
+                if not flash_files:
+                     self._parent.report_error("No valid firmware files specified.")
+                     return
+
+
+                command.extend(flash_files)
+
+            else:
+                # Assume ESP8266 or generic single file flash
+                chip = "esp8266" # Assume ESP8266 if not ESP32/Arduino
+                command.extend([f"--chip", chip])
+                command.extend(["--before", "default_reset", "--after", "hard_reset"])
+                command.extend(["write_flash"])
+                # https://github.com/espressif/esptool/issues/599
+                command.extend(["--flash_size", "detect"])
+                command.extend(["--flash_mode", self._config.mode])
+                 # Check existence for ESP8266 firmware too
+                if self._config.firmware_path and os.path.exists(self._config.firmware_path):
+                    command.extend(["0x00000", self._config.firmware_path])
+                else:
+                    self._parent.report_error(f"Firmware file not found: {self._config.firmware_path}")
+                    return # Cannot proceed
+
 
             if self._config.erase_before_flash:
-                command.append("--erase-all")
+                # Erase flag might need reconsideration depending on final ESP32 logic
+                # Only erase if flashing only app (or ESP8266)
+                should_erase = False
+                if not is_esp32_arduino:
+                    should_erase = True
+                elif is_esp32_arduino and len(flash_files) == 2: # ESP32 with only app file
+                    should_erase = True
+
+                if should_erase:
+                     command.append("--erase-all")
+                elif is_esp32_arduino: # ESP32 with multiple files
+                    print("Note: Erase flag ignored for ESP32 multi-file flashing.")
+
 
             print("Command: esptool.py %s\n" % " ".join(command))
 
@@ -106,7 +189,13 @@ class FlashingThread(threading.Thread):
                   "mode.")
         except SerialException as e:
             self._parent.report_error(e.strerror)
-            raise e
+            # No need to re-raise, just report error
+        except FileNotFoundError as e: # More specific error
+             self._parent.report_error(f"File not found error: {e}")
+        except Exception as e:
+            # Catch other potential errors like invalid JSON in config or esptool errors
+            self._parent.report_error(f"An unexpected error occurred: {str(e)}")
+            # Consider logging the full traceback for debugging
 
 
 # ---------------------------------------------------------------------------
@@ -121,17 +210,32 @@ class FlashConfig:
         self.mode = "dio"
         self.firmware_path = None
         self.port = None
+        # ESP32 specific optional paths/offsets
+        self.custom_bootloader_path = None
+        self.custom_bootloader_offset = "0x1000"
+        self.custom_partitions_path = None
+        self.custom_partitions_offset = "0x8000"
+
 
     @classmethod
     def load(cls, file_path):
         conf = cls()
         if os.path.exists(file_path):
-            with open(file_path, 'r') as f:
-                data = json.load(f)
-            conf.port = data['port']
-            conf.baud = data['baud']
-            conf.mode = data['mode']
-            conf.erase_before_flash = data['erase']
+            try: # Added try-except for robustness if config file is old/malformed
+                with open(file_path, 'r') as f:
+                    data = json.load(f)
+                conf.port = data.get('port') # Use .get for safer loading
+                conf.baud = data.get('baud', 115200)
+                conf.mode = data.get('mode', 'dio')
+                conf.erase_before_flash = data.get('erase', False)
+                # Load ESP32 specific fields if they exist
+                conf.custom_bootloader_path = data.get('custom_bootloader_path')
+                conf.custom_bootloader_offset = data.get('custom_bootloader_offset', "0x1000")
+                conf.custom_partitions_path = data.get('custom_partitions_path')
+                conf.custom_partitions_offset = data.get('custom_partitions_offset', "0x8000")
+            except (json.JSONDecodeError, KeyError) as e:
+                 print(f"Warning: Could not load config file {file_path}: {e}")
+                 # Use default values
         return conf
 
     def safe(self, file_path):
@@ -140,11 +244,21 @@ class FlashConfig:
             'baud': self.baud,
             'mode': self.mode,
             'erase': self.erase_before_flash,
+            # Save ESP32 specific fields
+            'custom_bootloader_path': self.custom_bootloader_path,
+            'custom_bootloader_offset': self.custom_bootloader_offset,
+            'custom_partitions_path': self.custom_partitions_path,
+            'custom_partitions_offset': self.custom_partitions_offset,
         }
-        with open(file_path, 'w') as f:
-            json.dump(data, f)
+        try: # Added try-except for robustness
+            with open(file_path, 'w') as f:
+                json.dump(data, f, indent=4) # Added indent for readability
+        except IOError as e:
+             print(f"Warning: Could not save config file {file_path}: {e}")
+
 
     def is_complete(self):
+        # Only firmware_path and port are strictly mandatory to start
         return self.firmware_path is not None and self.port is not None
 
 # ---------------------------------------------------------------------------
@@ -203,22 +317,51 @@ class NodeMcuFlasher(wx.Frame):
             self._config.port = choice.GetString(choice.GetSelection())
 
         def on_pick_file(event):
-            self._config.firmware_path = event.GetPath().replace("'", "")
+            path = event.GetPath().replace("'", "")
+            self._config.firmware_path = path
+            # TODO (Optional): Add logic here to show/hide ESP32 options based on path?
 
-        panel = wx.Panel(self)
+        def on_pick_bootloader(event):
+            path = event.GetPath().replace("'", "")
+            self._config.custom_bootloader_path = path
 
-        # Fix popup that never goes away.
+        def on_bootloader_offset_changed(event):
+            offset = event.GetString()
+            # Basic validation, could be improved (e.g., regex for hex)
+            if offset.startswith("0x"):
+                self._config.custom_bootloader_offset = offset
+            else:
+                 # Optionally provide feedback to the user about invalid format
+                 print(f"Invalid bootloader offset format: {offset}. Using default {self._config.custom_bootloader_offset}")
+                 # Or reset the text control value: self.bootloader_offset_ctrl.SetValue(self._config.custom_bootloader_offset)
+
+
+        def on_pick_partitions(event):
+            path = event.GetPath().replace("'", "")
+            self._config.custom_partitions_path = path
+
+        def on_partitions_offset_changed(event):
+             offset = event.GetString()
+             if offset.startswith("0x"):
+                 self._config.custom_partitions_offset = offset
+             else:
+                 print(f"Invalid partitions offset format: {offset}. Using default {self._config.custom_partitions_offset}")
+                 # self.partitions_offset_ctrl.SetValue(self._config.custom_partitions_offset)
+
+        # Fix popup that never goes away. Moved definition here before panel.Bind
         def onHover(event):
             global hovered
             if(len(hovered) != 0 ):
-                hovered[0].Dismiss() 
+                hovered[0].Dismiss()
                 hovered = []
 
-        panel.Bind(wx.EVT_MOTION,onHover)
+        panel = wx.Panel(self)
+        panel.Bind(wx.EVT_MOTION, onHover) # Now onHover is defined
 
         hbox = wx.BoxSizer(wx.HORIZONTAL)
 
-        fgs = wx.FlexGridSizer(7, 2, 10, 10)
+        # Correct number of rows is 11 (Port, FW, BL, BL Offset, Part, Part Offset, Baud, Mode, Erase, Button, Console)
+        fgs = wx.FlexGridSizer(11, 2, 10, 10) # Rows, Cols, vgap, hgap
 
         self.choice = wx.Choice(panel, choices=self._get_serial_ports())
         self.choice.Bind(wx.EVT_CHOICE, on_select_port)
@@ -228,7 +371,8 @@ class NodeMcuFlasher(wx.Frame):
         reload_button.Bind(wx.EVT_BUTTON, on_reload)
         reload_button.SetToolTip("Reload serial device list")
 
-        file_picker = wx.FilePickerCtrl(panel, style=wx.FLP_USE_TEXTCTRL)
+        # Main Firmware File Picker
+        file_picker = wx.FilePickerCtrl(panel, style=wx.FLP_USE_TEXTCTRL, message="Select Firmware File")
         file_picker.Bind(wx.EVT_FILEPICKER_CHANGED, on_pick_file)
 
         serial_boxsizer = wx.BoxSizer(wx.HORIZONTAL)
@@ -241,7 +385,6 @@ class NodeMcuFlasher(wx.Frame):
             style = wx.RB_GROUP if index == 0 else 0
             radio_button = wx.RadioButton(panel, name="baud-%d" % baud_rate, label="%d" % baud_rate, style=style)
             radio_button.rate = baud_rate
-            # sets default value
             radio_button.SetValue(baud_rate == self._config.baud)
             radio_button.Bind(wx.EVT_RADIOBUTTON, on_baud_changed)
             sizer.Add(radio_button)
@@ -280,7 +423,34 @@ class NodeMcuFlasher(wx.Frame):
         add_erase_radio_button(erase_boxsizer, 0, False, "no", erase is False)
         add_erase_radio_button(erase_boxsizer, 1, True, "yes, wipes all data", erase is True)
 
-        button = wx.Button(panel, -1, "Flash NodeMCU")
+        # --- New ESP32 Controls ---
+        bootloader_label = wx.StaticText(panel, label="Bootloader (optional)")
+        self.bootloader_picker = wx.FilePickerCtrl(panel, style=wx.FLP_USE_TEXTCTRL | wx.FLP_FILE_MUST_EXIST, message="Select Bootloader Binary")
+        self.bootloader_picker.Bind(wx.EVT_FILEPICKER_CHANGED, on_pick_bootloader)
+        if self._config.custom_bootloader_path: # Restore path on load
+             self.bootloader_picker.SetPath(self._config.custom_bootloader_path)
+
+
+        bootloader_offset_label = wx.StaticText(panel, label="Bootloader offset")
+        self.bootloader_offset_ctrl = wx.TextCtrl(panel, value=self._config.custom_bootloader_offset)
+        self.bootloader_offset_ctrl.Bind(wx.EVT_TEXT, on_bootloader_offset_changed)
+        self.bootloader_offset_ctrl.SetToolTip("Address (e.g., 0x1000)")
+
+        partitions_label = wx.StaticText(panel, label="Partitions (optional)")
+        self.partitions_picker = wx.FilePickerCtrl(panel, style=wx.FLP_USE_TEXTCTRL | wx.FLP_FILE_MUST_EXIST, message="Select Partitions Binary")
+        self.partitions_picker.Bind(wx.EVT_FILEPICKER_CHANGED, on_pick_partitions)
+        if self._config.custom_partitions_path: # Restore path on load
+             self.partitions_picker.SetPath(self._config.custom_partitions_path)
+
+
+        partitions_offset_label = wx.StaticText(panel, label="Partitions offset")
+        self.partitions_offset_ctrl = wx.TextCtrl(panel, value=self._config.custom_partitions_offset)
+        self.partitions_offset_ctrl.Bind(wx.EVT_TEXT, on_partitions_offset_changed)
+        self.partitions_offset_ctrl.SetToolTip("Address (e.g., 0x8000)")
+
+
+        # --- Flash Button and Console ---
+        button = wx.Button(panel, -1, "Flash Device")
         button.Bind(wx.EVT_BUTTON, on_clicked)
 
         self.console_ctrl = wx.TextCtrl(panel, style=wx.TE_MULTILINE | wx.TE_READONLY | wx.HSCROLL)
@@ -290,17 +460,17 @@ class NodeMcuFlasher(wx.Frame):
         self.console_ctrl.SetForegroundColour(wx.BLUE)
         self.console_ctrl.SetDefaultStyle(wx.TextAttr(wx.BLUE))
 
+        # --- Labels for Controls ---
         port_label = wx.StaticText(panel, label="Serial port")
-        file_label = wx.StaticText(panel, label="NodeMCU firmware")
+        file_label = wx.StaticText(panel, label="Firmware")
         baud_label = wx.StaticText(panel, label="Baud rate")
         flashmode_label = wx.StaticText(panel, label="Flash mode")
-
         def on_info_hover(event):
             global hovered
             if(len(hovered) == 0):
                 from HtmlPopupTransientWindow import HtmlPopupTransientWindow
                 win = HtmlPopupTransientWindow(self, wx.SIMPLE_BORDER, __flash_help__, "#FFB6C1", (410, 140))
-                
+
                 image = event.GetEventObject()
                 image_position = image.ClientToScreen((0, 0))
                 image_size = image.GetSize()
@@ -308,28 +478,31 @@ class NodeMcuFlasher(wx.Frame):
 
                 win.Popup()
                 hovered = [win]
-
-
         icon = wx.StaticBitmap(panel, wx.ID_ANY, images.Info.GetBitmap())
         icon.Bind(wx.EVT_MOTION, on_info_hover)
-
         flashmode_label_boxsizer = wx.BoxSizer(wx.HORIZONTAL)
         flashmode_label_boxsizer.Add(flashmode_label, 1, wx.EXPAND)
         flashmode_label_boxsizer.AddStretchSpacer(0)
         flashmode_label_boxsizer.Add(icon)
-
         erase_label = wx.StaticText(panel, label="Erase flash")
         console_label = wx.StaticText(panel, label="Console")
 
+        # --- Add All Controls to Grid ---
         fgs.AddMany([
                     port_label, (serial_boxsizer, 1, wx.EXPAND),
                     file_label, (file_picker, 1, wx.EXPAND),
+                    bootloader_label, (self.bootloader_picker, 1, wx.EXPAND),
+                    bootloader_offset_label, (self.bootloader_offset_ctrl, 1, wx.EXPAND),
+                    partitions_label, (self.partitions_picker, 1, wx.EXPAND),
+                    partitions_offset_label, (self.partitions_offset_ctrl, 1, wx.EXPAND),
                     baud_label, baud_boxsizer,
                     flashmode_label_boxsizer, flashmode_boxsizer,
                     erase_label, erase_boxsizer,
-                    (wx.StaticText(panel, label="")), (button, 1, wx.EXPAND),
-                    (console_label, 1, wx.EXPAND), (self.console_ctrl, 1, wx.EXPAND)])
-        fgs.AddGrowableRow(6, 1)
+                    (wx.StaticText(panel, label="")), (button, 1, wx.EXPAND), # Empty label for button alignment
+                    console_label, (self.console_ctrl, 1, wx.EXPAND) # Console spans 1 label + 1 control = 2 cols
+                   ])
+        # The console is in the 11th row (index 10)
+        fgs.AddGrowableRow(10, 1)
         fgs.AddGrowableCol(1, 1)
         hbox.Add(fgs, proportion=2, flag=wx.ALL | wx.EXPAND, border=15)
         panel.SetSizer(hbox)
@@ -383,7 +556,7 @@ class NodeMcuFlasher(wx.Frame):
 
     # Menu methods
     def _on_exit_app(self, event):
-        self._config.safe(self._get_config_file_path())
+        self._config.safe(self._get_config_file_path()) # Ensure the updated safe method is called
         self.Close(True)
 
     def _on_help_about(self, event):
