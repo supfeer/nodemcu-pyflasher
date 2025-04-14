@@ -1,7 +1,16 @@
 # -*- mode: python ; coding: utf-8 -*-
 
-# We need to add the flasher stub JSON files explicitly: https://github.com/espressif/esptool/issues/1059
-local_stub_flasher_path = "./.venv/Lib/site-packages/esptool/targets/stub_flasher"
+import os
+import importlib.util
+
+# Find the installed esptool package path dynamically
+esptool_spec = importlib.util.find_spec('esptool')
+if esptool_spec and esptool_spec.origin:
+    esptool_dir = os.path.dirname(esptool_spec.origin)
+    local_stub_flasher_path = os.path.join(esptool_dir, "targets", "stub_flasher")
+else:
+    # Fallback or error if esptool is not found (should not happen if requirements are installed)
+    raise ImportError("Could not find the esptool package. Is it installed?")
 
 a = Analysis(
     ['nodemcu-pyflasher.py'],
@@ -9,8 +18,8 @@ a = Analysis(
     binaries=[],
     datas=[
         ("images", "images"),
-        ("{}/1".format(local_stub_flasher_path), "./esptool/targets/stub_flasher/1"),
-        ("{}/2".format(local_stub_flasher_path), "./esptool/targets/stub_flasher/2")
+        (os.path.join(local_stub_flasher_path, "1"), os.path.join(".", "esptool", "targets", "stub_flasher", "1")),
+        (os.path.join(local_stub_flasher_path, "2"), os.path.join(".", "esptool", "targets", "stub_flasher", "2"))
     ],
     hiddenimports=[],
     hookspath=[],
